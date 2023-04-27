@@ -1,0 +1,90 @@
+diff --git a/backends/tpm/tpm_emulator.c b/backends/tpm/tpm_emulator.c
+index 87d061e9bb..e113eb29ac 100644
+--- a/backends/tpm/tpm_emulator.c
++++ b/backends/tpm/tpm_emulator.c
+@@ -161,21 +161,20 @@ static int tpm_emulator_unix_tx_bufs(TPMEmulator *tpm_emu,
+         is_selftest = tpm_util_is_selftest(in, in_len);
+     }
+ 
+-    ret = qio_channel_write_all(tpm_emu->data_ioc, (char *)in, in_len, errp);
+-    if (ret != 0) {
++    ret = write((QIO_CHANNEL_SOCKET)(tpm_emu->data_ioc)->fd, (char *)in, in_len);
++    if (ret <= 0) {
+         return -1;
+     }
+ 
+-    ret = qio_channel_read_all(tpm_emu->data_ioc, (char *)out,
+-              sizeof(struct tpm_resp_hdr), errp);
+-    if (ret != 0) {
++    ret = read((QIO_CHANNEL_SOCKET)(tpm_emu->data_ioc)->fd, (char *)out,
++              sizeof(struct tpm_resp_hdr));
++    if (ret <= 0) {
+         return -1;
+     }
+ 
+-    ret = qio_channel_read_all(tpm_emu->data_ioc,
+-              (char *)out + sizeof(struct tpm_resp_hdr),
+-              tpm_cmd_get_size(out) - sizeof(struct tpm_resp_hdr), errp);
+-    if (ret != 0) {
++    ret = read((QIO_CHANNEL_SOCKET)(tpm_emu->data_ioc)->fd, (char *)out + sizeof(struct tpm_resp_hdr),
++              tpm_cmd_get_size(out) - sizeof(struct tpm_resp_hdr));
++    if (ret < 0) {
+         return -1;
+     }
+ 
+@@ -506,38 +505,33 @@ static int tpm_emulator_block_migration(TPMEmulator *tpm_emu)
+ 
+ static int tpm_emulator_prepare_data_fd(TPMEmulator *tpm_emu)
+ {
+-    ptm_res res;
+     Error *err = NULL;
+-    int fds[2] = { -1, -1 };
+-
+-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) < 0) {
+-        error_report("tpm-emulator: Failed to create socketpair");
+-        return -1;
+-    }
+-
+-    qemu_chr_fe_set_msgfds(&tpm_emu->ctrl_chr, fds + 1, 1);
+-
+-    if (tpm_emulator_ctrlcmd(tpm_emu, CMD_SET_DATAFD, &res, 0,
+-                             sizeof(res)) < 0 || res != 0) {
+-        error_report("tpm-emulator: Failed to send CMD_SET_DATAFD: %s",
++    /* Set the info of data channel. */ 
++    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
++	if (sockfd < 0) {
++        error_report("tpm-emulator: Failed to create socket fd: %s",
+                      strerror(errno));
+-        goto err_exit;
+-    }
+-
+-    tpm_emu->data_ioc = QIO_CHANNEL(qio_channel_socket_new_fd(fds[0], &err));
++		goto err_exit;
++	}
++    struct sockaddr_in s_addr;
++	memset(&s_addr, 0, sizeof(s_addr));
++	s_addr.sin_family = AF_INET;
++	s_addr.sin_port = htons(2321);
++	if (connect(sockfd, (struct sockaddr *)&s_addr, sizeof(s_addr)) == -1) {
++		error_report("tpm-emulator: Failed to connect tpm default port 2321: %s",
++                     strerror(errno));
++		goto err_exit;
++	}
++    tpm_emu->data_ioc = QIO_CHANNEL(qio_channel_socket_new_fd(sockfd, &err));
+     if (err) {
+         error_prepend(&err, "tpm-emulator: Failed to create io channel: ");
+         error_report_err(err);
+         goto err_exit;
+     }
+-
+-    closesocket(fds[1]);
+-
+     return 0;
+ 
+ err_exit:
+-    closesocket(fds[0]);
+-    closesocket(fds[1]);
++    closesocket(sockfd);
+     return -1;
+ }
+ 

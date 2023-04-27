@@ -1,0 +1,202 @@
+diff --git a/src/swtpm/mainloop.c b/src/swtpm/mainloop.c
+index 846f02c..4003f32 100644
+--- a/src/swtpm/mainloop.c
++++ b/src/swtpm/mainloop.c
+@@ -50,6 +50,7 @@
+ #include <sys/stat.h>
+ #include <fcntl.h>
+ #include <sys/socket.h>
++#include <pthread.h>
+ 
+ #include <libtpms/tpm_error.h>
+ #include <libtpms/tpm_library.h>
+@@ -74,6 +75,21 @@ bool tpm_running = false;
+ 
+ bool mainloop_terminate;
+ 
++void
++PlatformSvcRoutine(void* arg)
++{   /* Reference from Repository: ms-tpm-20-ref*/
++    struct PlatformSvcRoutinePara *fun_para;
++    fun_para = (struct PlatformSvcRoutinePara *) arg;
++    /* IF Change locality, how to notify main process.*/
++    do {
++        fun_para->fd = ctrlchannel_process_fd(fun_para->fd,
++                                fun_para->mainloop_terminate,
++                                fun_para->locality, 
++                                fun_para->tpm_running,
++                                fun_para->mlp);
++    } while(fun_para->fd > 0);
++}
++
+ TPM_RESULT
+ mainloop_cb_get_locality(TPM_MODIFIER_INDICATOR *loc,
+                          uint32_t tpmnum SWTPM_ATTR_UNUSED)
+@@ -130,7 +146,7 @@ int mainLoop(struct mainLoopParams *mlp,
+     int                 ctrlfd;
+     int                 ctrlclntfd;
+     int                 sockfd;
+-    int                 ready;
++    int                 connection_counter = 0;
+     struct iovec        iov[3];
+     uint32_t            ack = htobe32(0);
+     struct tpm2_resp_prefix respprefix;
+@@ -186,106 +202,42 @@ int mainLoop(struct mainLoopParams *mlp,
+                 logprintf(STDERR_FILENO, "Could not send Startup: 0x%x\n", rc);
+         }
+     }
+-
++    ctrlclntfd = accept(ctrlfd, NULL, 0);
++    if(ctrlclntfd == 0)
++    {
++        logprintf(STDOUT_FILENO, "CTRL FD: Accept error.  Error is 0x");
++        return -1;
++    }
++    else {
++        pthread_t   thread_id;
++        pthread_attr_t attr; 
++        pthread_attr_init( &attr ); 
++        pthread_attr_setdetachstate(&attr,1); 
++        int ret;
++        struct PlatformSvcRoutinePara ctrldaemon_para;
++        ctrldaemon_para.fd = ctrlclntfd;
++        ctrldaemon_para.mainloop_terminate = &mainloop_terminate;
++        ctrldaemon_para.locality = &locality;
++        ctrldaemon_para.tpm_running = &tpm_running;
++        ctrldaemon_para.mlp = mlp;
++        ret = pthread_create(&thread_id, &attr, (void*)PlatformSvcRoutine, (void*)&ctrldaemon_para);
++        if (ret == -1)
++        {
++            logprintf(STDOUT_FILENO,"pthread_create failed: %s", strerror(ret));
++        }
++    }
+     while (!mainloop_terminate) {
+ 
+         while (rc == 0) {
+-            if (mlp->flags & MAIN_LOOP_FLAG_USE_FD)
+-                connection_fd.fd = mlp->fd;
+-
+-            struct pollfd pollfds[] = {
+-                [DATA_CLIENT_FD] = {
+-                    .fd = connection_fd.fd,
+-                    .events = POLLIN | POLLHUP,
+-                    .revents = 0,
+-                },
+-                [NOTIFY_FD] = {
+-                    .fd = notify_fd,
+-                    .events = POLLIN,
+-                    .revents = 0,
+-                },
+-                [CTRL_SERVER_FD] = {
+-                    .fd = -1,
+-                    .events = POLLIN,
+-                    .revents = 0,
+-                },
+-                [CTRL_CLIENT_FD] = {
+-                    .fd = ctrlclntfd,
+-                    .events = POLLIN | POLLHUP,
+-                    .revents = 0,
+-                },
+-                [DATA_SERVER_FD] = {
+-                    /* listen socket for accepting clients */
+-                    .fd = -1,
+-                    .events = POLLIN,
+-                    .revents = 0,
+-                }
+-            };
+-
+-            /* only listend for clients if we don't have one */
+-            if (connection_fd.fd < 0)
+-                pollfds[DATA_SERVER_FD].fd = sockfd;
+-            if (ctrlclntfd < 0)
+-                pollfds[CTRL_SERVER_FD].fd = ctrlfd;
+-
+-            ready = poll(pollfds, 5, -1);
+-            if (ready < 0 && errno == EINTR)
+-                continue;
+-
+-            if (ready < 0 ||
+-                (pollfds[NOTIFY_FD].revents & POLLIN) != 0) {
+-                SWTPM_IO_Disconnect(&connection_fd);
+-                break;
+-            }
+-
+-            if (pollfds[DATA_CLIENT_FD].revents & (POLLHUP | POLLERR)) {
+-                logprintf(STDERR_FILENO, "Data client disconnected\n");
+-                mlp->fd = -1;
+-                /* chardev and unixio get this signal, not tcp */
+-                if (mlp->flags & MAIN_LOOP_FLAG_END_ON_HUP) {
+-                    /* only the chardev terminates here */
+-                    mainloop_terminate = true;
+-                    break;
++            if (connection_counter == 0) {
++                connection_fd.fd = accept(sockfd, NULL, 0);
++                if(connection_fd.fd == 0)
++                {
++                    logprintf(STDOUT_FILENO,"DATA FD: Accept error.  Error is 0x");
++                    return -1;
+                 }
++                connection_counter += 1;
+             }
+-
+-            if (pollfds[DATA_SERVER_FD].revents & POLLIN)
+-                connection_fd.fd = accept(pollfds[DATA_SERVER_FD].fd, NULL, 0);
+-
+-            if (pollfds[CTRL_SERVER_FD].revents & POLLIN)
+-                ctrlclntfd = accept(ctrlfd, NULL, 0);
+-
+-            if (pollfds[CTRL_CLIENT_FD].revents & POLLIN) {
+-                ctrlclntfd = ctrlchannel_process_fd(ctrlclntfd,
+-                                                    &mainloop_terminate,
+-                                                    &locality, &tpm_running,
+-                                                    mlp);
+-                if (ctrlclntfd < 0 &&
+-                    mlp->flags & MAIN_LOOP_FLAG_CTRL_END_ON_HUP)
+-                    mainloop_terminate = true;
+-
+-                if (mainloop_terminate)
+-                    break;
+-            }
+-
+-            if (pollfds[CTRL_CLIENT_FD].revents & POLLHUP) {
+-                if (ctrlclntfd >= 0)
+-                    close(ctrlclntfd);
+-                ctrlclntfd = -1;
+-                /* unixio gets this signal, not tcp */
+-                if (mlp->flags & MAIN_LOOP_FLAG_CTRL_END_ON_HUP) {
+-                    mainloop_terminate = true;
+-                    break;
+-                }
+-            }
+-
+-            if (!(pollfds[DATA_CLIENT_FD].revents & POLLIN))
+-                continue;
+-
+-            /* before processing a command ensure that the storage is locked */
+-            if ((mainloop_terminate = !mainloop_ensure_locked_storage(mlp)))
+-                break;
+-
+             /* Read the command.  The number of bytes is determined by 'paramSize' in the stream */
+             if (rc == 0) {
+                 rc = SWTPM_IO_Read(&connection_fd, command, &command_length,
+diff --git a/src/swtpm/mainloop.h b/src/swtpm/mainloop.h
+index d58c21d..fd25a0f 100644
+--- a/src/swtpm/mainloop.h
++++ b/src/swtpm/mainloop.h
+@@ -74,7 +74,15 @@ struct mainLoopParams {
+     unsigned int locking_retries;
+ #define DEFAULT_LOCKING_RETRIES  300 /* 300 * 10ms */
+ };
+-
++struct PlatformSvcRoutinePara
++{
++    int fd;
++    bool *mainloop_terminate;
++    TPM_MODIFIER_INDICATOR *locality;
++    bool *tpm_running;
++    struct mainLoopParams *mlp;
++};
++void PlatformSvcRoutine(void* arg);
+ int mainLoop(struct mainLoopParams *mlp,
+              int notify_fd);
+ TPM_RESULT mainloop_cb_get_locality(TPM_MODIFIER_INDICATOR *loc,
