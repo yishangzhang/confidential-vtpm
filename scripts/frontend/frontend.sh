@@ -13,7 +13,7 @@ for i in {1..5}; do
     echo "git submodule update --init failed (attempt $i)"
   fi
 done
-
+git apply ../../hacks/qemu/0001-QEMU-Supports-connecting-with-Swtpm-using-two-TCP-channels.patch
 if ! command -v qemu-system-x86_64 >/dev/null 2>&1;
 then
     cd qemu
@@ -56,9 +56,10 @@ qemu-system-x86_64 -enable-kvm -m 2048  -nographic \
     -netdev user,id=vmnic -net user,hostfwd=tcp::10021-:22 \
     -net nic,model=e1000 \
     -device e1000,netdev=vmnic,romfile= \
-    -hda  focal-server-cloudimg-amd64.img \
-    -chardev socket,id=chrtpm,path=/tmp/mytpm2/swtpm-sock \
-    -tpmdev emulator,id=tpm0,chardev=chrtpm \
+    -hda ../focal-server-cloudimg-amd64.img \
+    -chardev socket,id=chrtpm,host=127.0.0.1,port=2322 \
+    -chardev socket,id=chardatatpm,host=127.0.0.1,port=2321 \
+    -tpmdev emulator,id=tpm0,chardev=chrtpm,datachardev=chardatatpm \
     -device tpm-tis,tpmdev=tpm0
 
 handle_error() {
